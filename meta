@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""
+meta — macOS file metadata tool.
+
+Usage:
+    meta <verb> <noun> [args...] [options]
+
+Verbs:  get, set, add, remove, clear, delete, search, backup, restore
+
+    meta get all <file>                          Full JSON metadata dump
+    meta get tags <file>                         Tags with colour info
+    meta get label <file>                        Current label colour
+    meta get comment <file>                      Finder comment
+    meta get xattr <file> <key>                  Custom xattr value
+    meta get xattrs <file>                       All xattr keys and values
+
+    meta set tags <file> <tag>...                Replace all tags
+    meta set label <file> <colour>               Set exclusive label colour
+    meta set comment <file> <text>               Set Finder comment
+    meta set xattr <file> <key> <value>          Write custom xattr
+
+    meta add tags <file|dir> <tag>...            Append tags
+                              [--pattern <glob>]
+
+    meta remove tags <file> <tag>...             Remove specific tags
+
+    meta clear tags <file>                       Remove all tags
+    meta clear label <file>                      Remove label (keeps text tags)
+    meta clear comment <file>                    Clear Finder comment
+
+    meta delete xattr <file> <key>               Delete xattr key
+
+    meta search tag <tag> [--dir <path>]         Search by tag
+    meta search label <colour> [--dir <path>]    Search by label colour
+    meta search xattr <key> [--dir <path>]       Search custom xattr key
+    meta search text <terms> [--dir <path>]      Spotlight text search
+    meta search query <predicate> [--dir <path>] Raw mdfind query
+
+    meta backup <file>                           Snapshot metadata
+    meta restore <file>                          Restore from backup
+
+Colours: none, gray/grey, green, purple, blue, yellow, red, orange (or 0-7)
+Tags:    'name' for text, 'name,colour' for colour (e.g. 'review,red')
+
+Any set/add/clear/remove command accepts --dir <path> [--pattern <glob>]
+to apply to all matching files in a directory instead of a single file.
+"""
+
+import json
+import sys
+import os
+import subprocess
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+import core
+import help as helptext
+
+
+def output(data):
+    """Print data as JSON."""
+    if isinstance(data, str):
+        print(data)
+    else:
+        print(json.dumps(data, indent=2))
+
+
+def die(msg):
+    """Print error to stderr and exit 1."""
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Argument parsing helpers ───────────────────────────────────────────────
+
+def parse_flags(args):
+    """Split args into positional args and flags.
+    Returns (positionals, {'--dir': val, '--pattern': val, ...})
+    """
+    positionals = []
+    flags = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--"):
+            key = args[i]
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                flags[key] = args[i + 1]
+                i += 2
+            else:
+                flags[key] = True
+                i += 1
+        else:
+            positionals.append(args[i])
+            i += 1
+    return positionals, flags
+
+
+def require_args(positionals, minimum, usage):
+    """Ensure enough positional args, else die with usage."""
+    if len(positionals) < minimum:
+        die(f"Usage: {usage}")
+
+
+# ── GET ────────────────────────────────────────────────────────────────────
+
+def cmd_get(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["get"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta get <noun> <file> [key]")
+
+    noun = pos[0]
+
+    if noun == "all":
+        output(core.get_all(pos[1]))
+
+    elif noun == "tags":
+        output(core.get_tags(pos[1]))
+
+    elif noun == "label":
+        output(core.get_label(pos[1]))
+
+    elif noun == "comment":
+        val = core.get_comment(pos[1])
+        output({"comment": val})
+
+    elif noun == "xattr":
+        require_args(pos, 3, "meta get xattr <file> <key>")
+        val = core.get_xattr(pos[1], pos[2])
+        output({"key": pos[2], "value": val})
+
+    elif noun == "xattrs":
+        output(core.get_xattrs(pos[1]))
+
+    else:
+        die(f"Unknown noun for 'get': {noun}. Use: all, tags, label, comment, xattr, xattrs")
+
+
+# ── SET ────────────────────────────────────────────────────────────────────
+
+def cmd_set(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["set"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta set <noun> <file> <value>...")
+    noun = pos[0]
+
+    if noun == "tags":
+        require_args(pos, 3, "meta set tags <file> <tag>...")
+        target = pos[1]
+        tag_specs = pos[2:]
+
+        if "--dir" in flags or "--pattern" in flags:
+            # Directory mode: apply to all matching files
+            directory = flags.get("--dir", target)
+            if not isinstance(directory, str):
+                directory = target
+            pattern = flags.get("--pattern")
+            files = core._collect_files(directory, pattern)
+            results = []
+            for f in files:
+                for i, spec in enumerate(tag_specs):
+                    if i == 0:
+                        core._run(["osxmetadata", "--set", "tags", spec, f])
+                    else:
+                        core._run(["osxmetadata", "--append", "tags", spec, f])
+                core._mdimport(f)
+                results.append(f)
+            output({"success": True, "operation": "set tags", "count": len(results), "files": results})
+        else:
+            output(core.set_tags(target, *tag_specs))
+
+    elif noun == "label":
+        require_args(pos, 3, "meta set label <file|dir> <colour>")
+        target = pos[1]
+
+        if "--dir" in flags or "--pattern" in flags:
+            # Directory mode: apply to all files inside directory
+            directory = flags.get("--dir", target)
+            if not isinstance(directory, str):
+                directory = target
+            pattern = flags.get("--pattern")
+            files = core._collect_files(directory, pattern)
+            results = []
+            errors = []
+            for f in files:
+                try:
+                    results.append(core.set_label(f, pos[2]))
+                except Exception as e:
+                    errors.append({"file": f, "error": str(e)})
+            output({"success": True, "operation": "set label", "count": len(results), "errors": errors})
+        else:
+            output(core.set_label(target, pos[2]))
+
+    elif noun == "comment":
+        require_args(pos, 3, "meta set comment <file> <text>")
+        output(core.set_comment(pos[1], pos[2]))
+
+    elif noun == "xattr":
+        require_args(pos, 4, "meta set xattr <file> <key> <value>")
+        output(core.set_xattr(pos[1], pos[2], pos[3]))
+
+    else:
+        die(f"Unknown noun for 'set': {noun}. Use: tags, label, comment, xattr")
+
+
+# ── ADD ────────────────────────────────────────────────────────────────────
+
+def cmd_add(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["add"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta add <noun> <file|dir> <value>...")
+    noun = pos[0]
+
+    if noun == "tags" or noun == "tag":
+        require_args(pos, 3, "meta add tags <file|dir> <tag>... [--pattern <glob>]")
+        target = pos[1]
+        tag_specs = pos[2:]
+        pattern = flags.get("--pattern")
+        output(core.add_tags(target, *tag_specs, pattern=pattern))
+
+    else:
+        die(f"Unknown noun for 'add': {noun}. Use: tags")
+
+
+# ── REMOVE ─────────────────────────────────────────────────────────────────
+
+def cmd_remove(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["remove"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta remove <noun> <file> <value>...")
+    noun = pos[0]
+
+    if noun == "tags" or noun == "tag":
+        require_args(pos, 3, "meta remove tags <file> <tag>...")
+        output(core.remove_tags(pos[1], *pos[2:]))
+
+    else:
+        die(f"Unknown noun for 'remove': {noun}. Use: tags")
+
+
+# ── CLEAR ──────────────────────────────────────────────────────────────────
+
+def cmd_clear(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["clear"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta clear <noun> <file>")
+    noun = pos[0]
+
+    if noun == "tags":
+        output(core.clear_tags(pos[1]))
+
+    elif noun == "label":
+        output(core.clear_label(pos[1]))
+
+    elif noun == "comment":
+        output(core.clear_comment(pos[1]))
+
+    else:
+        die(f"Unknown noun for 'clear': {noun}. Use: tags, label, comment")
+
+
+# ── DELETE ─────────────────────────────────────────────────────────────────
+
+def cmd_delete(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["delete"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta delete <noun> <file> <key>")
+    noun = pos[0]
+
+    if noun == "xattr":
+        require_args(pos, 3, "meta delete xattr <file> <key>")
+        output(core.delete_xattr(pos[1], pos[2]))
+
+    else:
+        die(f"Unknown noun for 'delete': {noun}. Use: xattr")
+
+
+# ── SEARCH ─────────────────────────────────────────────────────────────────
+
+def cmd_search(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["search"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 2, "meta search <type> <value> [--dir <path>]")
+    search_type = pos[0]
+    search_value = pos[1]
+    directory = flags.get("--dir")
+
+    if search_type == "tag":
+        results = core.search_tag(search_value, directory)
+    elif search_type == "label":
+        results = core.search_label(search_value, directory)
+    elif search_type == "xattr":
+        results = core.search_xattr(search_value, directory or ".")
+    elif search_type == "text":
+        results = core.search_text(search_value, directory)
+    elif search_type == "query":
+        results = core.search_query(search_value, directory)
+    else:
+        die(f"Unknown search type: {search_type}. Use: tag, label, xattr, text, query")
+
+    output({"results": results, "count": len(results)})
+
+
+# ── BACKUP / RESTORE ───────────────────────────────────────────────────────
+
+def cmd_backup(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["backup"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 1, "meta backup <file>")
+    output(core.backup(pos[0]))
+
+
+def cmd_restore(args):
+    if args and args[0] in ("--help", "-h"):
+        print(VERB_HELP["restore"])
+        return
+    pos, flags = parse_flags(args)
+    require_args(pos, 1, "meta restore <file>")
+    output(core.restore(pos[0]))
+
+
+# ── Main dispatch ──────────────────────────────────────────────────────────
+
+VERB_HELP = {
+    "get": """\
+meta get — read metadata from a file
+
+  meta get all <file>           Full JSON dump of every metadata attribute
+  meta get tags <file>          Tags with name, colour index, and colour name
+  meta get label <file>         Current label colour (from FinderInfo xattr)
+  meta get comment <file>       Finder comment text
+  meta get xattr <file> <key>   Value of a specific custom xattr
+  meta get xattrs <file>        All xattr keys and their values
+
+All commands return JSON. 'get all' returns the full osxmetadata JSON blob.
+""",
+    "set": """\
+meta set — write metadata (replaces existing value)
+
+  meta set tags <file> <tag>...           Replace all tags on a file
+  meta set label <file> <colour>          Set exclusive label colour
+  meta set comment <file> <text>          Set Finder comment
+  meta set xattr <file> <key> <value>     Write custom xattr
+
+Tags: 'name' for plain text, 'name,colour' for colour (e.g. 'review,red').
+Colours: none, gray/grey, green, purple, blue, yellow, red, orange (or 0-7).
+
+'set label' is the exclusive label setter — it replaces any existing colour
+while preserving all text tags. See: meta help concepts
+
+Add --dir <path> [--pattern <glob>] to apply to all matching files
+in a directory. Examples:
+  meta set label . red --pattern '*.pdf'
+  meta set tags ~/Docs/ 'project,blue' --dir ~/Docs/
+""",
+    "add": """\
+meta add — append without replacing existing values
+
+  meta add tags <file|dir> <tag>... [--pattern <glob>]
+
+Adds one or more tags to a file without removing existing tags.
+Tags: 'name' for plain text, 'name,colour' for colour (e.g. 'review,red').
+
+Accepts a directory as target — applies to all files inside it.
+Use --pattern to filter (e.g. --pattern '*.pdf').
+
+Examples:
+  meta add tags report.pdf 'draft'
+  meta add tags ~/Documents/ 'project-x' --pattern '*.md'
+""",
+    "remove": """\
+meta remove — remove specific items from a multi-valued attribute
+
+  meta remove tags <file> <tag>...
+
+Removes one or more named tags from a file. Other tags are left untouched.
+
+Example:
+  meta remove tags report.pdf draft outdated
+""",
+    "clear": """\
+meta clear — empty a value (attribute still exists, just has no content)
+
+  meta clear tags <file>       Remove ALL tags from a file
+  meta clear label <file>     Remove the colour label ONLY (keeps text tags)
+  meta clear comment <file>   Erase the Finder comment
+
+'clear label' is important — it removes just the colour while preserving
+all text tags. The file ends up with tags but no label dot.
+""",
+    "delete": """\
+meta delete — remove an attribute key entirely
+
+  meta delete xattr <file> <key>
+
+Deletes the xattr key from the file. The key ceases to exist.
+This is different from 'clear' which empties a value but leaves the attribute.
+Use 'delete' for custom xattr keys. Use 'clear' for tags/labels/comments.
+""",
+    "search": """\
+meta search — find files by metadata
+
+  meta search tag <tag> [--dir <path>]         Spotlight search by tag name
+  meta search label <colour> [--dir <path>]    Spotlight search by label colour
+  meta search xattr <key> [--dir <path>]       Filesystem scan for custom xattr
+  meta search text <terms> [--dir <path>]      Spotlight text content search
+  meta search query <predicate> [--dir <path>] Raw mdfind predicate
+
+Tag, label, and text searches use Spotlight — fast but may lag 1-2 seconds
+for recently-written metadata.
+
+Xattr search scans the filesystem directly — slower but finds custom xattrs
+that Spotlight cannot see. Only searches one directory level.
+
+Query search passes a raw Spotlight predicate. Examples:
+  meta search query "kMDItemContentType == 'com.adobe.pdf'"
+  meta search query "(kMDItemUserTags == 'inbox') && (kMDItemFSLabel == 6)"
+
+See: meta help search for full details.
+""",
+    "backup": """\
+meta backup — snapshot file metadata
+
+  meta backup <file>
+
+Creates a .osxmetadata.json file in the same directory as <file>,
+containing all metadata that osxmetadata knows about.
+
+Use 'meta restore' to revert. Useful before bulk changes.
+""",
+    "restore": """\
+meta restore — restore file metadata from backup
+
+  meta restore <file>
+
+Restores metadata from the .osxmetadata.json file in the same directory.
+This is the companion to 'meta backup'.
+""",
+}
+
+COMMANDS = {
+    "get": cmd_get,
+    "set": cmd_set,
+    "add": cmd_add,
+    "remove": cmd_remove,
+    "clear": cmd_clear,
+    "delete": cmd_delete,
+    "search": cmd_search,
+    "backup": cmd_backup,
+    "restore": cmd_restore,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("--help", "-h"):
+        print(helptext.REFERENCE)
+        sys.exit(0)
+
+    if args[0] in ("help",):
+        if len(args) > 1 and args[1] in helptext.TOPICS:
+            print(helptext.TOPICS[args[1]])
+        elif len(args) > 1:
+            die(f"Unknown help topic: {args[1]}. Use: {', '.join(helptext.TOPICS.keys())}")
+        else:
+            print(helptext.REFERENCE)
+        sys.exit(0)
+
+    verb = args[0]
+    rest = args[1:]
+
+    if verb not in COMMANDS:
+        die(f"Unknown verb: {verb}. Use: {', '.join(COMMANDS.keys())}")
+
+    try:
+        # Intercept --help at verb level
+        if rest and rest[0] in ("--help", "-h"):
+            print(VERB_HELP.get(verb, f"No help for '{verb}'."))
+            sys.exit(0)
+
+        COMMANDS[verb](rest)
+    except SystemExit:
+        raise
+    except FileNotFoundError as e:
+        die(str(e))
+    except ValueError as e:
+        die(str(e))
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else ""
+        die(f"Command failed: {' '.join(e.cmd)}\n{stderr}")
+    except Exception as e:
+        die(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
