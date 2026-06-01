@@ -2,8 +2,6 @@
 
 A command-line tool for reading, writing, and searching macOS file metadata — Finder tags, colour labels, Finder comments, and custom extended attributes.
 
-All output is JSON. All commands exit 0 on success, 1 on error.
-
 ## Why this exists
 
 macOS has rich file metadata, but the standard tools have gaps. `tag` doesn't enforce label exclusivity. `osxmetadata` doesn't handle custom xattrs or search. `xattr` is low-level. And no tool correctly handles the distinction between **tags** (multi-valued text labels) and **labels** (exclusive colour dots).
@@ -66,7 +64,9 @@ meta restore report.pdf
 
 ## Commands
 
-The tool uses a **verb–noun** pattern. Run `meta` or `meta --help` for the full reference.
+The tool uses a **verb–noun** pattern. Run `meta` or `meta --help` for the full reference. 
+
+All output is JSON. All commands exit 0 on success, 1 on error.
 
 ### Reading
 
@@ -187,6 +187,4 @@ tests/
   run_tests.py      # Self-contained test suite
 ```
 
-## Licence
 
-Personal use.
