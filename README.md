@@ -12,7 +12,7 @@ macOS has rich file metadata, but the standard tools have gaps. `tag` doesn't en
 
 ### Prerequisites
 
-- **macOS** (APFS, Apple Silicon or Intel)
+- **macOS**
 - **Python 3.10+**
 - **[osxmetadata](https://github.com/RhetTbull/osxmetadata)** — install via pipx:
 
